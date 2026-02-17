@@ -7,6 +7,90 @@ windowName = ""
 currentTableIndex = 0;
 isAnimating = false;
 
+// Audio manager for table audio with crossfade
+// Uses a single reusable Audio element to avoid pywebview autoplay restrictions
+const tableAudio = {
+    audio: null,         // single reusable Audio element
+    fadeId: null,        // interval handle for current fade
+    fadeDuration: 500,   // fade duration in ms
+    maxVolume: 0.8,
+    currentUrl: null,    // track what's currently playing
+
+    _ensureAudio() {
+        if (!this.audio) {
+            this.audio = new Audio();
+            this.audio.loop = true;
+        }
+        return this.audio;
+    },
+
+    play(url) {
+        if (!url) {
+            this.stop();
+            return;
+        }
+
+        // If same track is already playing, do nothing
+        if (this.currentUrl === url && !this.audio?.paused) {
+            return;
+        }
+
+        const audio = this._ensureAudio();
+
+        // If something is currently playing, fade out then switch
+        if (!audio.paused && audio.volume > 0) {
+            this._fade(audio.volume, 0, () => {
+                audio.src = url;
+                this.currentUrl = url;
+                audio.play().then(() => {
+                    this._fade(0, this.maxVolume);
+                }).catch(e => console.log("Audio play failed:", e.message));
+            });
+        } else {
+            // Nothing playing, just start with fade in
+            audio.volume = 0;
+            audio.src = url;
+            this.currentUrl = url;
+            audio.play().then(() => {
+                this._fade(0, this.maxVolume);
+            }).catch(e => console.log("Audio play failed:", e.message));
+        }
+    },
+
+    stop() {
+        if (this.audio && !this.audio.paused) {
+            this._fade(this.audio.volume, 0, () => {
+                this.audio.pause();
+                this.currentUrl = null;
+            });
+        } else {
+            clearInterval(this.fadeId);
+            this.currentUrl = null;
+        }
+    },
+
+    _fade(from, to, onComplete) {
+        clearInterval(this.fadeId);
+        const audio = this.audio;
+        if (!audio) { if (onComplete) onComplete(); return; }
+
+        audio.volume = from;
+        const steps = this.fadeDuration / 20;
+        const delta = (to - from) / steps;
+
+        this.fadeId = setInterval(() => {
+            const next = audio.volume + delta;
+            if ((delta > 0 && next >= to) || (delta < 0 && next <= to) || delta === 0) {
+                audio.volume = to;
+                clearInterval(this.fadeId);
+                if (onComplete) onComplete();
+            } else {
+                audio.volume = next;
+            }
+        }, 20);
+    }
+};
+
 // init the core interface to VPinFE
 const vpin = new VPinFECore();
 vpin.init();
@@ -39,13 +123,16 @@ async function receiveEvent(message) {
         updateScreen();
     }
     else if (message.type == "TableLaunching") {
+        tableAudio.stop();
         await fadeOut();
     }
     else if (message.type == "TableLaunchComplete") {
         fadeIn();
+        tableAudio.play(vpin.getAudioURL(currentTableIndex));
     }
     else if (message.type == "RemoteLaunching") {
         // Remote launch from manager UI
+        tableAudio.stop();
         showRemoteLaunchOverlay(message.table_name);
         await fadeOut();
     }
@@ -53,6 +140,7 @@ async function receiveEvent(message) {
         // Remote launch completed
         hideRemoteLaunchOverlay();
         fadeIn();
+        tableAudio.play(vpin.getAudioURL(currentTableIndex));
     }
     else if (message.type == "TableDataChange") {
         currentTableIndex = message.index;
@@ -366,6 +454,8 @@ function updateScreen(direction = null) {
         updateBGImage();
         updateTableInfo();
         buildCarousel(direction);
+        // Play audio for the selected table
+        tableAudio.play(vpin.getAudioURL(currentTableIndex));
     } else if (windowName === "bg") {
         updateBGImage();
     } else if (windowName === "dmd") {
