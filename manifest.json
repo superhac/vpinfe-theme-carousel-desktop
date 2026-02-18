@@ -1,10 +1,10 @@
 {
   "name": "Carousel Desktop",
-  "version": "1.2",
+  "version": "1.3",
   "author": "superhac",
   "description": "A theme for desktop players with wheel carousel.",
   "preview_image": "preview.png",
   "supported_screens": 3,
   "type": "desktop",
-  "change_log": "Added audio support.  @MajorFrenchy"
+  "change_log": "Fixed non-stopping audio when launching tables."
 }

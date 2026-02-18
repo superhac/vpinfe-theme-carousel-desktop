@@ -8,64 +8,75 @@ currentTableIndex = 0;
 isAnimating = false;
 
 // Audio manager for table audio with crossfade
-// Uses a single reusable Audio element to avoid pywebview autoplay restrictions
+// Uses a single reusable Audio element to avoid pywebview autoplay restrictions.
+// audio.play() is triggered via Python's evaluate_js (privileged context) to
+// bypass WebKitGTK's autoplay policy that blocks gamepad-triggered playback.
 const tableAudio = {
-    audio: null,         // single reusable Audio element
+    audio: Object.assign(new Audio(), { loop: true }),
     fadeId: null,        // interval handle for current fade
     fadeDuration: 500,   // fade duration in ms
     maxVolume: 0.8,
-    currentUrl: null,    // track what's currently playing
+    pendingUrl: null,    // URL we want to play (set immediately)
+    playingUrl: null,    // URL that is actually playing (set on success)
 
-    _ensureAudio() {
-        if (!this.audio) {
-            this.audio = new Audio();
-            this.audio.loop = true;
-        }
-        return this.audio;
-    },
-
-    play(url) {
+    play(url, retries = 3) {
         if (!url) {
             this.stop();
             return;
         }
 
-        // If same track is already playing, do nothing
-        if (this.currentUrl === url && !this.audio?.paused) {
+        // If this track is already playing successfully, do nothing
+        if (this.playingUrl === url && !this.audio.paused) {
             return;
         }
 
-        const audio = this._ensureAudio();
+        this.pendingUrl = url;
+        const audio = this.audio;
 
-        // If something is currently playing, fade out then switch
-        if (!audio.paused && audio.volume > 0) {
-            this._fade(audio.volume, 0, () => {
-                audio.src = url;
-                this.currentUrl = url;
-                audio.play().then(() => {
-                    this._fade(0, this.maxVolume);
-                }).catch(e => console.log("Audio play failed:", e.message));
-            });
-        } else {
-            // Nothing playing, just start with fade in
-            audio.volume = 0;
-            audio.src = url;
-            this.currentUrl = url;
-            audio.play().then(() => {
+        // Stop any current fade and immediately switch source
+        clearInterval(this.fadeId);
+        audio.pause();
+        audio.volume = 0;
+        audio.src = url;
+        this.playingUrl = null;
+        this._retries = retries;
+
+        // Trigger play via Python's evaluate_js to bypass autoplay restrictions
+        vpin.call("trigger_audio_play");
+    },
+
+    // Called from Python via evaluate_js (privileged context bypasses autoplay policy)
+    _resumePlay() {
+        const url = this.pendingUrl;
+        const retries = this._retries || 0;
+        if (!url) return;
+
+        this.audio.play().then(() => {
+            if (this.pendingUrl === url) {
+                this.playingUrl = url;
                 this._fade(0, this.maxVolume);
-            }).catch(e => console.log("Audio play failed:", e.message));
-        }
+            }
+        }).catch(e => {
+            console.log("Audio play failed:", e.message, `(${retries} retries left)`);
+            this.playingUrl = null;
+            // Retry - HTTP server may not be ready yet on startup
+            if (retries > 0 && this.pendingUrl === url) {
+                this._retries = retries - 1;
+                setTimeout(() => vpin.call("trigger_audio_play"), 1000);
+            }
+        });
     },
 
     stop() {
+        this.pendingUrl = null;
         if (this.audio && !this.audio.paused) {
             this._fade(this.audio.volume, 0, () => {
                 this.audio.pause();
-                this.currentUrl = null;
+                this.playingUrl = null;
             });
         } else {
             clearInterval(this.fadeId);
-            this.currentUrl = null;
+            this.playingUrl = null;
         }
     },
 
@@ -128,7 +139,7 @@ async function receiveEvent(message) {
     }
     else if (message.type == "TableLaunchComplete") {
         fadeIn();
-        tableAudio.play(vpin.getAudioURL(currentTableIndex));
+        if (windowName === "table") tableAudio.play(vpin.getAudioURL(currentTableIndex));
     }
     else if (message.type == "RemoteLaunching") {
         // Remote launch from manager UI
@@ -140,7 +151,7 @@ async function receiveEvent(message) {
         // Remote launch completed
         hideRemoteLaunchOverlay();
         fadeIn();
-        tableAudio.play(vpin.getAudioURL(currentTableIndex));
+        if (windowName === "table") tableAudio.play(vpin.getAudioURL(currentTableIndex));
     }
     else if (message.type == "TableDataChange") {
         currentTableIndex = message.index;
@@ -184,6 +195,7 @@ async function handleInput(input) {
             });
             break;
         case "joyselect":
+            tableAudio.stop();
             vpin.sendMessageToAllWindows({ type: "TableLaunching" });
             await fadeOut();
             await vpin.launchTable(currentTableIndex);
