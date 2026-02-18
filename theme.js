@@ -8,8 +8,10 @@ currentTableIndex = 0;
 isAnimating = false;
 
 // Audio manager for table audio with crossfade
-// Uses a single reusable Audio element. Chromium's --autoplay-policy flag
-// allows direct audio.play() calls without user gesture requirements.
+// Uses a single reusable Audio element. Tries direct audio.play() first
+// (works in Chromium with --autoplay-policy flag). If blocked by autoplay
+// policy (pywebview/WebKitGTK), falls back to trigger_audio_play via Python's
+// evaluate_js which runs in a privileged context.
 const tableAudio = {
     audio: Object.assign(new Audio(), { loop: true }),
     fadeId: null,        // interval handle for current fade
@@ -37,16 +39,45 @@ const tableAudio = {
         audio.src = url;
         this.currentUrl = url;
 
+        // Try direct play first (Chromium allows this via --autoplay-policy)
         audio.play().then(() => {
-            // Only fade in if we haven't switched to a different track
+            if (this.currentUrl === url) {
+                this._fade(0, this.maxVolume);
+            }
+        }).catch(e => {
+            if (e.name === 'NotAllowedError') {
+                // Autoplay blocked (pywebview/WebKitGTK) - ask Python to
+                // trigger play via evaluate_js (privileged context)
+                console.log("Audio autoplay blocked, falling back to Python bridge");
+                this._retries = retries;
+                vpin.call("trigger_audio_play").catch(() => {
+                    console.log("trigger_audio_play not available");
+                });
+            } else {
+                console.log("Audio play failed:", e.message, `(${retries} retries left)`);
+                // Retry - HTTP server may not be ready yet on startup
+                if (retries > 0 && this.currentUrl === url) {
+                    setTimeout(() => this.play(url, retries - 1), 1000);
+                }
+            }
+        });
+    },
+
+    // Called from Python via evaluate_js (privileged context bypasses autoplay policy)
+    _resumePlay() {
+        const url = this.currentUrl;
+        const retries = this._retries || 0;
+        if (!url) return;
+
+        this.audio.play().then(() => {
             if (this.currentUrl === url) {
                 this._fade(0, this.maxVolume);
             }
         }).catch(e => {
             console.log("Audio play failed:", e.message, `(${retries} retries left)`);
-            // Retry - HTTP server may not be ready yet on startup
             if (retries > 0 && this.currentUrl === url) {
-                setTimeout(() => this.play(url, retries - 1), 1000);
+                this._retries = retries - 1;
+                setTimeout(() => vpin.call("trigger_audio_play"), 1000);
             }
         });
     },
