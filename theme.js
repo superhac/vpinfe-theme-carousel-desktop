@@ -46,13 +46,11 @@ const tableAudio = {
             }
         }).catch(e => {
             if (e.name === 'NotAllowedError') {
-                // Autoplay blocked (pywebview/WebKitGTK) - ask Python to
-                // trigger play via evaluate_js (privileged context)
+                // Autoplay blocked (pywebview/WebKitGTK) - wait for audio to
+                // load, then ask Python to play via evaluate_js (privileged context)
                 console.log("Audio autoplay blocked, falling back to Python bridge");
                 this._retries = retries;
-                vpin.call("trigger_audio_play").catch(() => {
-                    console.log("trigger_audio_play not available");
-                });
+                this._triggerWhenReady(url);
             } else {
                 console.log("Audio play failed:", e.message, `(${retries} retries left)`);
                 // Retry - HTTP server may not be ready yet on startup
@@ -63,7 +61,27 @@ const tableAudio = {
         });
     },
 
-    // Called from Python via evaluate_js (privileged context bypasses autoplay policy)
+    // Wait for audio source to load, then request privileged play from Python.
+    // URL check ensures stale requests from fast navigation are ignored.
+    _triggerWhenReady(url) {
+        if (this.currentUrl !== url) return;
+        if (this.audio.readyState >= 2) {
+            vpin.call("trigger_audio_play").catch(() => {
+                console.log("trigger_audio_play not available");
+            });
+        } else {
+            this.audio.addEventListener('canplay', () => {
+                if (this.currentUrl === url) {
+                    vpin.call("trigger_audio_play").catch(() => {
+                        console.log("trigger_audio_play not available");
+                    });
+                }
+            }, { once: true });
+        }
+    },
+
+    // Called from Python via evaluate_js (privileged context bypasses autoplay policy).
+    // Audio is guaranteed loaded by _triggerWhenReady before this is called.
     _resumePlay() {
         const url = this.currentUrl;
         const retries = this._retries || 0;
@@ -77,7 +95,7 @@ const tableAudio = {
             console.log("Audio play failed:", e.message, `(${retries} retries left)`);
             if (retries > 0 && this.currentUrl === url) {
                 this._retries = retries - 1;
-                setTimeout(() => vpin.call("trigger_audio_play"), 1000);
+                setTimeout(() => this._triggerWhenReady(url), 500);
             }
         });
     },
