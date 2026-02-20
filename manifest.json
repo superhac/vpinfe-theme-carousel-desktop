@@ -1,10 +1,10 @@
 {
   "name": "Carousel Desktop",
-  "version": "1.6",
+  "version": "1.7",
   "author": "superhac",
   "description": "A theme for desktop players with wheel carousel.",
   "preview_image": "preview.png",
   "supported_screens": 3,
   "type": "desktop",
-  "change_log": "audio (chromium based bulds): add regular play for chromium browsers since they dont use evaulutejs.#3"
+  "change_log": "new TableRunning event now controls fade."
 }

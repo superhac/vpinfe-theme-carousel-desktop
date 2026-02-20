@@ -229,8 +229,8 @@ async function handleInput(input) {
         case "joyselect":
             tableAudio.stop();
             vpin.sendMessageToAllWindows({ type: "TableLaunching" });
+            vpin.launchTable(currentTableIndex); // fire and forget — TableRunning/TableLaunchComplete arrive via events
             await fadeOut();
-            await vpin.launchTable(currentTableIndex);
             break;
         case "joyback":
             // do something on joyback if you want
