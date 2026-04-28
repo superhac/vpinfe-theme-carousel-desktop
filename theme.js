@@ -6,6 +6,17 @@ Testing theme with carousel layout
 windowName = ""
 currentTableIndex = 0;
 isAnimating = false;
+wheelMode = "tables";
+collectionEntries = [];
+currentCollectionIndex = 0;
+attractIdleTimer = null;
+attractAdvanceTimer = null;
+attractModeActive = false;
+attractSuspended = false;
+
+const carouselAnimationMs = 180;
+const ATTRACT_IDLE_MS = 60000;
+const ATTRACT_STEP_MS = 7000;
 
 // Audio manager for table audio with crossfade
 // Uses a single reusable Audio element. Tries direct audio.play() first
@@ -153,6 +164,10 @@ vpin.ready.then(async () => {
 
     // Initialize the display
     updateScreen();
+    if (windowName === "table") {
+        setupAttractMode();
+        markUserActivity(false);
+    }
 });
 
 // listener for windows events.  VPinFECore uses this to send events to all windows.
@@ -162,32 +177,48 @@ async function receiveEvent(message) {
 
     // Handle UI updates based on event type
     if (message.type == "TableIndexUpdate") {
+        if (isCollectionMode()) leaveCollectionMode();
         currentTableIndex = message.index;
         updateScreen();
+        if (!attractModeActive) markUserActivity(false);
     }
     else if (message.type == "TableLaunching") {
+        attractSuspended = true;
+        stopAttractMode();
         tableAudio.stop();
         await fadeOut();
     }
     else if (message.type == "TableLaunchComplete") {
+        attractSuspended = false;
         fadeIn();
-        if (windowName === "table") tableAudio.play(vpin.getAudioURL(currentTableIndex));
+        if (windowName === "table") {
+            tableAudio.play(vpin.getAudioURL(currentTableIndex));
+            markUserActivity(false);
+        }
     }
     else if (message.type == "RemoteLaunching") {
         // Remote launch from manager UI
+        attractSuspended = true;
+        stopAttractMode();
         tableAudio.stop();
         showRemoteLaunchOverlay(message.table_name);
         await fadeOut();
     }
     else if (message.type == "RemoteLaunchComplete") {
         // Remote launch completed
+        attractSuspended = false;
         hideRemoteLaunchOverlay();
         fadeIn();
-        if (windowName === "table") tableAudio.play(vpin.getAudioURL(currentTableIndex));
+        if (windowName === "table") {
+            tableAudio.play(vpin.getAudioURL(currentTableIndex));
+            markUserActivity(false);
+        }
     }
     else if (message.type == "TableDataChange") {
+        if (isCollectionMode()) leaveCollectionMode();
         currentTableIndex = message.index;
         updateScreen();
+        if (!attractModeActive) markUserActivity(false);
     }
 }
 
@@ -202,38 +233,57 @@ async function receiveEvent(message) {
 */
 async function handleInput(input) {
     if (isAnimating) return; // Prevent rapid inputs during animation
+    markUserActivity();
 
     switch (input) {
         case "joyleft":
             isAnimating = true;
-            currentTableIndex = wrapIndex(currentTableIndex - 1, vpin.tableData.length);
+            if (isCollectionMode()) {
+                currentCollectionIndex = wrapIndex(currentCollectionIndex - 1, collectionEntries.length);
+            } else {
+                currentTableIndex = wrapIndex(currentTableIndex - 1, vpin.tableData.length);
+            }
             updateScreen('left');
 
             // tell other windows the table index changed
-            vpin.sendMessageToAllWindows({
-                type: 'TableIndexUpdate',
-                index: this.currentTableIndex
-            });
+            if (!isCollectionMode()) {
+                vpin.sendMessageToAllWindows({
+                    type: 'TableIndexUpdate',
+                    index: currentTableIndex
+                });
+            }
             break;
         case "joyright":
             isAnimating = true;
-            currentTableIndex = wrapIndex(currentTableIndex + 1, vpin.tableData.length);
+            if (isCollectionMode()) {
+                currentCollectionIndex = wrapIndex(currentCollectionIndex + 1, collectionEntries.length);
+            } else {
+                currentTableIndex = wrapIndex(currentTableIndex + 1, vpin.tableData.length);
+            }
             updateScreen('right');
 
             // tell other windows the table index changed
-            vpin.sendMessageToAllWindows({
-                type: 'TableIndexUpdate',
-                index: this.currentTableIndex
-            });
+            if (!isCollectionMode()) {
+                vpin.sendMessageToAllWindows({
+                    type: 'TableIndexUpdate',
+                    index: currentTableIndex
+                });
+            }
             break;
         case "joyselect":
+            if (isCollectionMode()) {
+                await selectCurrentCollection();
+                break;
+            }
+            attractSuspended = true;
+            stopAttractMode();
             tableAudio.stop();
             vpin.sendMessageToAllWindows({ type: "TableLaunching" });
             vpin.launchTable(currentTableIndex); // fire and forget — TableRunning/TableLaunchComplete arrive via events
             await fadeOut();
             break;
         case "joyback":
-            // do something on joyback if you want
+            await toggleCollectionMode();
             break;
     }
 }
@@ -309,6 +359,11 @@ function updateDMDImage() {
 // Update table information text
 // Update table information text
 function updateTableInfo() {
+    if (isCollectionMode()) {
+        updateCollectionInfo();
+        return;
+    }
+
     if (!vpin.tableData || vpin.tableData.length === 0) {
         // Clear table info when no tables
         const nameEl = document.getElementById('tableName');
@@ -381,20 +436,86 @@ function updateTableInfo() {
     nameEl.style.fontSize = fontSize;
 }
 
+function updateCollectionInfo() {
+    const collection = collectionEntries[currentCollectionIndex] || {};
+    const nameEl = document.getElementById('tableName');
+    const metaEl = document.getElementById('tableMeta');
+    const authorsEl = document.getElementById('authorsText');
+    const tableCount = Number(collection.table_count);
+    const countText = Number.isFinite(tableCount)
+        ? tableCount + ' ' + (tableCount === 1 ? 'table' : 'tables')
+        : 'Collection';
+
+    if (nameEl) {
+        nameEl.textContent = collection.name || 'Collection';
+        nameEl.style.fontSize = '4vw';
+    }
+    if (metaEl) {
+        metaEl.textContent = collection.is_filter ? 'Filter collection' : countText;
+    }
+    if (authorsEl) {
+        authorsEl.textContent = countText;
+        authorsEl.style.fontSize = '2vw';
+    }
+}
+
+function parseMaybeJson(value, fallback) {
+    if (typeof value !== "string") return value ?? fallback;
+    try {
+        return JSON.parse(value);
+    } catch {
+        return fallback;
+    }
+}
+
+function isCollectionMode() {
+    return wheelMode === "collections";
+}
+
+function getCurrentCarouselIndex() {
+    return isCollectionMode() ? currentCollectionIndex : currentTableIndex;
+}
+
+function setCurrentCarouselIndex(index) {
+    if (isCollectionMode()) {
+        currentCollectionIndex = index;
+    } else {
+        currentTableIndex = index;
+    }
+}
+
+function getCarouselItemCount() {
+    return isCollectionMode() ? collectionEntries.length : (vpin.tableData?.length || 0);
+}
+
+function getCarouselWheelUrl(index) {
+    if (isCollectionMode()) {
+        return collectionEntries[index]?.image_url || "";
+    }
+    return vpin.getImageURL(index, "wheel");
+}
+
+function getCarouselAltText(index) {
+    if (isCollectionMode()) {
+        return collectionEntries[index]?.name || 'Collection ' + index;
+    }
+    return 'Table ' + index;
+}
+
 
 // Build the carousel with wheel images
 function buildCarousel(direction = null) {
     const track = document.getElementById('carouselTrack');
+    const itemCount = getCarouselItemCount();
 
-    if (!vpin.tableData || vpin.tableData.length === 0) {
+    if (!itemCount) {
         // Clear carousel when no tables
         track.innerHTML = '';
         isAnimating = false;
         return;
     }
 
-    const totalTables = vpin.tableData.length;
-    const visibleItems = Math.min(9, totalTables); // Show up to 9 items
+    const visibleItems = Math.min(9, itemCount); // Show up to 9 items
     const sideItems = Math.floor(visibleItems / 2);
 
     // Get existing items
@@ -404,23 +525,104 @@ function buildCarousel(direction = null) {
     if (existingItems.length === 0 || existingItems.length !== visibleItems || direction === null) {
         track.innerHTML = ''; // Clear all existing items
         for (let i = -sideItems; i <= sideItems; i++) {
-            const idx = wrapIndex(currentTableIndex + i, totalTables);
+            const idx = wrapIndex(getCurrentCarouselIndex() + i, itemCount);
             createCarouselItem(idx, i === 0, track);
         }
         isAnimating = false;
     } else if (direction !== null) {
-        // Update with animation (only for left/right navigation)
-        updateCarouselItems(existingItems, sideItems, totalTables, true);
+        // Slide one wheel slot, then rebuild around the new selected table.
+        animateCarouselShift(track, direction, sideItems, itemCount);
     }
 
 }
 
+function animateCarouselShift(track, direction, sideItems, itemCount) {
+    const step = getCarouselStep(track);
+    if (!step) {
+        updateCarouselItems(Array.from(track.children), sideItems, itemCount, false);
+        isAnimating = false;
+        return;
+    }
+
+    track.style.transition = 'none';
+    track.style.transform = 'translateX(0)';
+    track.style.width = `${track.getBoundingClientRect().width}px`;
+    track.style.justifyContent = 'flex-start';
+
+    if (direction === 'right') {
+        const nextEdgeIndex = wrapIndex(getCurrentCarouselIndex() + sideItems, itemCount);
+        createCarouselItem(nextEdgeIndex, false, track);
+        updateCarouselSelection(track, sideItems + 1);
+
+        requestAnimationFrame(() => {
+            track.style.transition = `transform ${carouselAnimationMs}ms cubic-bezier(0.2, 0.8, 0.2, 1)`;
+            track.style.transform = `translateX(${-step}px)`;
+        });
+    } else if (direction === 'left') {
+        const previousEdgeIndex = wrapIndex(getCurrentCarouselIndex() - sideItems, itemCount);
+        const newItem = createCarouselItem(previousEdgeIndex, false);
+        track.insertBefore(newItem, track.firstChild);
+        track.style.transform = `translateX(${-step}px)`;
+        updateCarouselSelection(track, sideItems);
+
+        requestAnimationFrame(() => {
+            track.style.transition = `transform ${carouselAnimationMs}ms cubic-bezier(0.2, 0.8, 0.2, 1)`;
+            track.style.transform = 'translateX(0)';
+        });
+    } else {
+        updateCarouselItems(Array.from(track.children), sideItems, itemCount, false);
+        isAnimating = false;
+        return;
+    }
+
+    let finished = false;
+    const finishShift = () => {
+        if (finished) return;
+        finished = true;
+        track.removeEventListener('transitionend', finishShift);
+        track.style.transition = 'none';
+        track.style.transform = 'translateX(0)';
+        rebuildCarouselItems(track, sideItems, itemCount);
+        track.style.width = '';
+        track.style.justifyContent = '';
+        isAnimating = false;
+    };
+
+    track.addEventListener('transitionend', finishShift, { once: true });
+    setTimeout(finishShift, carouselAnimationMs + 80);
+}
+
+function getCarouselStep(track) {
+    const first = track.children[0];
+    if (!first) return 0;
+
+    const itemWidth = first.getBoundingClientRect().width;
+    const styles = window.getComputedStyle(track);
+    const gap = parseFloat(styles.columnGap || styles.gap) || 0;
+    return itemWidth + gap;
+}
+
+function updateCarouselSelection(track, selectedIndex) {
+    Array.from(track.children).forEach((item, index) => {
+        item.classList.toggle('selected', index === selectedIndex);
+        item.classList.remove('jiggle');
+    });
+}
+
+function rebuildCarouselItems(track, sideItems, itemCount) {
+    track.innerHTML = '';
+    for (let i = -sideItems; i <= sideItems; i++) {
+        const idx = wrapIndex(getCurrentCarouselIndex() + i, itemCount);
+        createCarouselItem(idx, i === 0, track);
+    }
+}
+
 // Update carousel items in place
-function updateCarouselItems(existingItems, sideItems, totalTables, animated = false) {
+function updateCarouselItems(existingItems, sideItems, itemCount, animated = false) {
     existingItems.forEach((item, index) => {
         const offset = index - sideItems;
-        const idx = wrapIndex(currentTableIndex + offset, totalTables);
-        const wheelUrl = vpin.getImageURL(idx, "wheel");
+        const idx = wrapIndex(getCurrentCarouselIndex() + offset, itemCount);
+        const wheelUrl = getCarouselWheelUrl(idx);
 
         // Update selected class
         if (offset === 0) {
@@ -439,7 +641,7 @@ function updateCarouselItems(existingItems, sideItems, totalTables, animated = f
                         // Remove jiggle class after animation completes
                         setTimeout(() => {
                             item.classList.remove('jiggle');
-                        }, 500);
+                        }, carouselAnimationMs);
                     });
                 });
             }
@@ -452,7 +654,7 @@ function updateCarouselItems(existingItems, sideItems, totalTables, animated = f
         const img = item.querySelector('img');
         if (img && img.src !== wheelUrl) {
             img.src = wheelUrl;
-            img.alt = 'Table ' + idx;
+            img.alt = getCarouselAltText(idx);
         }
     });
 
@@ -460,13 +662,13 @@ function updateCarouselItems(existingItems, sideItems, totalTables, animated = f
     if (animated) {
         setTimeout(() => {
             isAnimating = false;
-        }, 600);
+        }, carouselAnimationMs);
     }
 }
 
 // Helper function to create a carousel item
 function createCarouselItem(idx, isSelected, track) {
-    const wheelUrl = vpin.getImageURL(idx, "wheel");
+    const wheelUrl = getCarouselWheelUrl(idx);
 
     const item = document.createElement('div');
     item.className = 'carousel-item';
@@ -474,21 +676,30 @@ function createCarouselItem(idx, isSelected, track) {
         item.classList.add('selected');
     }
 
-    const img = document.createElement('img');
-    img.src = wheelUrl;
-    img.alt = 'Table ' + idx;
+    if (wheelUrl) {
+        const img = document.createElement('img');
+        img.src = wheelUrl;
+        img.alt = getCarouselAltText(idx);
 
-    // Handle missing images
-    img.onerror = () => {
+        // Handle missing images
+        img.onerror = () => {
+            const placeholder = document.createElement('div');
+            placeholder.className = 'missing-placeholder';
+            placeholder.textContent = getCarouselAltText(idx);
+            item.innerHTML = '';
+            item.appendChild(placeholder);
+        };
+
+        item.appendChild(img);
+    } else {
         const placeholder = document.createElement('div');
         placeholder.className = 'missing-placeholder';
-        placeholder.textContent = 'No Image';
-        item.innerHTML = '';
+        placeholder.textContent = getCarouselAltText(idx);
         item.appendChild(placeholder);
-    };
+    }
 
-    item.appendChild(img);
-    track.appendChild(item);
+    if (track) track.appendChild(item);
+    return item;
 }
 
 // Main update function
@@ -540,6 +751,140 @@ function hideRemoteLaunchOverlay() {
     if (overlay) {
         overlay.style.display = 'none';
     }
+}
+
+function clearAttractTimers() {
+    if (attractIdleTimer) {
+        clearTimeout(attractIdleTimer);
+        attractIdleTimer = null;
+    }
+    if (attractAdvanceTimer) {
+        clearTimeout(attractAdvanceTimer);
+        attractAdvanceTimer = null;
+    }
+}
+
+function stopAttractMode() {
+    attractModeActive = false;
+    clearAttractTimers();
+}
+
+function shouldPauseAttractMode() {
+    return (
+        windowName !== "table" ||
+        attractSuspended ||
+        isCollectionMode() ||
+        !vpin.tableData ||
+        vpin.tableData.length < 2 ||
+        vpin.menuUP ||
+        vpin.collectionMenuUP ||
+        vpin.tutorialUP ||
+        document.getElementById("remote-launch-overlay")?.style.display === "flex"
+    );
+}
+
+function queueNextAttractAdvance() {
+    if (!attractModeActive) return;
+    attractAdvanceTimer = setTimeout(runAttractAdvance, ATTRACT_STEP_MS);
+}
+
+function runAttractAdvance() {
+    if (!attractModeActive || shouldPauseAttractMode()) {
+        stopAttractMode();
+        markUserActivity(false);
+        return;
+    }
+
+    currentTableIndex = wrapIndex(currentTableIndex + 1, vpin.tableData.length);
+    isAnimating = true;
+    updateScreen('right');
+    vpin.sendMessageToAllWindows({
+        type: 'TableIndexUpdate',
+        index: currentTableIndex
+    });
+    queueNextAttractAdvance();
+}
+
+function startAttractMode() {
+    if (shouldPauseAttractMode()) {
+        markUserActivity(false);
+        return;
+    }
+
+    attractModeActive = true;
+    runAttractAdvance();
+}
+
+function markUserActivity(stopAttract = true) {
+    if (windowName !== "table") return;
+
+    clearAttractTimers();
+    if (stopAttract) stopAttractMode();
+    attractIdleTimer = setTimeout(startAttractMode, ATTRACT_IDLE_MS);
+}
+
+function setupAttractMode() {
+    ["mousedown", "touchstart", "keydown"].forEach((eventName) => {
+        window.addEventListener(eventName, () => markUserActivity(), { passive: true });
+    });
+}
+
+async function toggleCollectionMode() {
+    stopAttractMode();
+    if (isCollectionMode()) {
+        leaveCollectionMode();
+    } else {
+        await enterCollectionMode();
+    }
+}
+
+async function enterCollectionMode() {
+    if (windowName !== "table") return;
+
+    const metadata = parseMaybeJson(await vpin.call("get_collections_metadata").catch(() => []), []);
+    const namedCollections = Array.isArray(metadata) ? metadata.filter(entry => entry && entry.name) : [];
+    collectionEntries = namedCollections;
+
+    if (!collectionEntries.length) return;
+
+    const currentCollection = await vpin.call("get_current_collection").catch(() => "None");
+    currentCollectionIndex = currentCollection && currentCollection !== "None"
+        ? Math.max(0, collectionEntries.findIndex(entry => entry.name === currentCollection))
+        : 0;
+    wheelMode = "collections";
+    isAnimating = false;
+    document.body.classList.add("collection-wheel-mode");
+    updateScreen();
+}
+
+function leaveCollectionMode() {
+    wheelMode = "tables";
+    isAnimating = false;
+    document.body.classList.remove("collection-wheel-mode");
+    updateScreen();
+    markUserActivity(false);
+}
+
+async function selectCurrentCollection() {
+    const collection = collectionEntries[currentCollectionIndex];
+    if (!collection?.name) return;
+
+    wheelMode = "tables";
+    document.body.classList.remove("collection-wheel-mode");
+    stopAttractMode();
+
+    await vpin.call("set_tables_by_collection", collection.name);
+    await vpin.getTableData();
+
+    currentTableIndex = 0;
+    isAnimating = false;
+    updateScreen();
+    vpin.sendMessageToAllWindows({
+        type: "TableDataChange",
+        index: currentTableIndex,
+        collection: collection.name
+    });
+    markUserActivity(false);
 }
 
 //
