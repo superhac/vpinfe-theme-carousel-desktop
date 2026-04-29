@@ -227,6 +227,8 @@ async function receiveEvent(message) {
     joyright
     joyup
     joydown
+    joypageup
+    joypagedown
     joyselect
     joymenu
     joycollectionmenu
@@ -237,38 +239,18 @@ async function handleInput(input) {
 
     switch (input) {
         case "joyleft":
-            isAnimating = true;
-            if (isCollectionMode()) {
-                currentCollectionIndex = wrapIndex(currentCollectionIndex - 1, collectionEntries.length);
-            } else {
-                currentTableIndex = wrapIndex(currentTableIndex - 1, vpin.tableData.length);
-            }
-            updateScreen('left');
-
-            // tell other windows the table index changed
-            if (!isCollectionMode()) {
-                vpin.sendMessageToAllWindows({
-                    type: 'TableIndexUpdate',
-                    index: currentTableIndex
-                });
-            }
+            moveIndex(-1);
             break;
         case "joyright":
-            isAnimating = true;
-            if (isCollectionMode()) {
-                currentCollectionIndex = wrapIndex(currentCollectionIndex + 1, collectionEntries.length);
-            } else {
-                currentTableIndex = wrapIndex(currentTableIndex + 1, vpin.tableData.length);
-            }
-            updateScreen('right');
-
-            // tell other windows the table index changed
-            if (!isCollectionMode()) {
-                vpin.sendMessageToAllWindows({
-                    type: 'TableIndexUpdate',
-                    index: currentTableIndex
-                });
-            }
+            moveIndex(1);
+            break;
+        case "joyup":
+        case "joypageup":
+            moveIndex(-getCarouselPageSize());
+            break;
+        case "joydown":
+        case "joypagedown":
+            moveIndex(getCarouselPageSize());
             break;
         case "joyselect":
             if (isCollectionMode()) {
@@ -288,12 +270,54 @@ async function handleInput(input) {
     }
 }
 
+function crossfadeContainerImage(container, nextUrl) {
+    const currentImg = container.querySelector('img:last-of-type');
+
+    if (currentImg && currentImg.dataset.url === nextUrl) {
+        return;
+    }
+
+    const incoming = document.createElement('img');
+    incoming.src = nextUrl;
+    incoming.dataset.url = nextUrl;
+    incoming.style.opacity = '0';
+
+    incoming.onload = () => {
+        const staleImages = Array.from(container.querySelectorAll('img')).filter((img) => img !== currentImg);
+        staleImages.forEach((img) => img.remove());
+
+        container.appendChild(incoming);
+
+        requestAnimationFrame(() => {
+            incoming.style.opacity = '1';
+            if (currentImg) {
+                currentImg.style.opacity = '0';
+            }
+        });
+
+        if (currentImg) {
+            setTimeout(() => {
+                if (currentImg.parentElement === container) {
+                    currentImg.remove();
+                }
+            }, 300);
+        }
+    };
+
+    incoming.onerror = () => {
+        if (incoming.parentElement === container) {
+            incoming.remove();
+        }
+        if (currentImg) {
+            currentImg.style.opacity = '1';
+        }
+    };
+}
+
 // Update the main BG image with smooth transition
 function updateBGImage() {
     const container = document.getElementById('bgImageContainer');
     if (!container) return; // Window may not have this element
-
-    const oldImg = container.querySelector('img');
 
     if (!vpin.tableData || vpin.tableData.length === 0) {
         // Clear background image when no tables
@@ -302,32 +326,13 @@ function updateBGImage() {
     }
 
     const bgUrl = vpin.getImageURL(currentTableIndex, "bg");
-
-    if (oldImg) {
-        oldImg.style.opacity = '0';
-        setTimeout(() => {
-            oldImg.src = bgUrl;
-            oldImg.style.opacity = '1';
-        }, 300);
-    } else {
-        const img = document.createElement('img');
-        img.src = bgUrl;
-        img.style.opacity = '0';
-        img.onload = () => {
-            requestAnimationFrame(() => {
-                img.style.opacity = '1';
-            });
-        };
-        container.appendChild(img);
-    }
+    crossfadeContainerImage(container, bgUrl);
 }
 
 // Update DMD image for DMD window
 function updateDMDImage() {
     const container = document.getElementById('dmdImageContainer');
     if (!container) return; // Window may not have this element
-
-    const oldImg = container.querySelector('img');
 
     if (!vpin.tableData || vpin.tableData.length === 0) {
         // Clear DMD image when no tables
@@ -336,24 +341,7 @@ function updateDMDImage() {
     }
 
     const dmdUrl = vpin.getImageURL(currentTableIndex, "dmd");
-
-    if (oldImg) {
-        oldImg.style.opacity = '0';
-        setTimeout(() => {
-            oldImg.src = dmdUrl;
-            oldImg.style.opacity = '1';
-        }, 300);
-    } else {
-        const img = document.createElement('img');
-        img.src = dmdUrl;
-        img.style.opacity = '0';
-        img.onload = () => {
-            requestAnimationFrame(() => {
-                img.style.opacity = '1';
-            });
-        };
-        container.appendChild(img);
-    }
+    crossfadeContainerImage(container, dmdUrl);
 }
 
 // Update table information text
@@ -488,6 +476,42 @@ function getCarouselItemCount() {
     return isCollectionMode() ? collectionEntries.length : (vpin.tableData?.length || 0);
 }
 
+function getCarouselPageSize() {
+    const itemCount = getCarouselItemCount();
+    if (!itemCount) return 1;
+    return Math.max(1, Math.min(9, itemCount));
+}
+
+function moveIndex(delta) {
+    const itemCount = getCarouselItemCount();
+    if (!itemCount || delta === 0) return;
+
+    const isCollection = isCollectionMode();
+    const currentIndex = isCollection ? currentCollectionIndex : currentTableIndex;
+    const nextIndex = wrapIndex(currentIndex + delta, itemCount);
+    if (nextIndex === currentIndex) return;
+
+    const isPageMove = Math.abs(delta) > 1;
+
+    isAnimating = true;
+    const direction = isPageMove
+        ? (delta < 0 ? 'up' : 'down')
+        : (delta < 0 ? 'left' : 'right');
+
+    if (isCollection) {
+        currentCollectionIndex = nextIndex;
+        updateScreen(direction);
+        return;
+    }
+
+    currentTableIndex = nextIndex;
+    updateScreen(direction);
+    vpin.sendMessageToAllWindows({
+        type: 'TableIndexUpdate',
+        index: currentTableIndex
+    });
+}
+
 function getCarouselWheelUrl(index) {
     if (isCollectionMode()) {
         return collectionEntries[index]?.image_url || "";
@@ -529,11 +553,16 @@ function buildCarousel(direction = null) {
             createCarouselItem(idx, i === 0, track);
         }
         isAnimating = false;
-    } else if (direction !== null) {
-        // Slide one wheel slot, then rebuild around the new selected table.
+    } else if (direction === 'left' || direction === 'right') {
+        // Horizontal slot shift for single-step left/right moves.
         animateCarouselShift(track, direction, sideItems, itemCount);
+    } else if (direction === 'up' || direction === 'down') {
+        // Vertical page transition with fixed timing/offset.
+        animateCarouselPageShift(track, direction, sideItems, itemCount);
+    } else {
+        rebuildCarouselItems(track, sideItems, itemCount);
+        isAnimating = false;
     }
-
 }
 
 function animateCarouselShift(track, direction, sideItems, itemCount) {
@@ -576,7 +605,10 @@ function animateCarouselShift(track, direction, sideItems, itemCount) {
     }
 
     let finished = false;
-    const finishShift = () => {
+    const finishShift = (e) => {
+        // Ignore transitionend events that bubble up from child items.
+        // Only act on the track's own transform transition (or the setTimeout fallback).
+        if (e && (e.target !== track || e.propertyName !== 'transform')) return;
         if (finished) return;
         finished = true;
         track.removeEventListener('transitionend', finishShift);
@@ -588,8 +620,72 @@ function animateCarouselShift(track, direction, sideItems, itemCount) {
         isAnimating = false;
     };
 
-    track.addEventListener('transitionend', finishShift, { once: true });
+    track.addEventListener('transitionend', finishShift);
     setTimeout(finishShift, carouselAnimationMs + 80);
+}
+
+function animateCarouselPageShift(track, direction, sideItems, itemCount) {
+    const container = track.parentElement;
+    if (!container) {
+        rebuildCarouselItems(track, sideItems, itemCount);
+        isAnimating = false;
+        return;
+    }
+
+    const step = getCarouselStep(track);
+    if (!step) {
+        updateCarouselItems(Array.from(track.children), sideItems, itemCount, false);
+        isAnimating = false;
+        return;
+    }
+
+    const outOffset = direction === 'up' ? step : -step;
+    const inStartOffset = -outOffset;
+
+    const trackRect = track.getBoundingClientRect();
+
+    const left = track.offsetLeft;
+    const top = track.offsetTop;
+    const width = trackRect.width;
+
+    const newTrack = track.cloneNode(false);
+    rebuildCarouselItems(newTrack, sideItems, itemCount);
+
+    const prepareOverlayTrack = (el, zIndex) => {
+        el.style.position = 'absolute';
+        el.style.left = `${left}px`;
+        el.style.top = `${top}px`;
+        el.style.width = `${width}px`;
+        el.style.margin = '0';
+        el.style.pointerEvents = 'none';
+        el.style.zIndex = String(zIndex);
+        el.style.transition = 'none';
+        el.style.justifyContent = 'flex-start';
+    };
+
+    prepareOverlayTrack(newTrack, 6);
+    newTrack.style.transform = `translateY(${inStartOffset}px)`;
+
+    track.style.visibility = 'hidden';
+    container.appendChild(newTrack);
+
+    requestAnimationFrame(() => {
+        newTrack.style.transition = `transform ${carouselAnimationMs}ms cubic-bezier(0.2, 0.8, 0.2, 1)`;
+        newTrack.style.transform = 'translateY(0)';
+    });
+
+    const finish = () => {
+        newTrack.remove();
+        rebuildCarouselItems(track, sideItems, itemCount);
+        track.style.visibility = '';
+        track.style.transition = 'none';
+        track.style.transform = 'translateX(0) translateY(0)';
+        track.style.width = '';
+        track.style.justifyContent = '';
+        isAnimating = false;
+    };
+
+    setTimeout(finish, carouselAnimationMs + 40);
 }
 
 function getCarouselStep(track) {
